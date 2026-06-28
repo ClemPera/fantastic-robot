@@ -1,118 +1,142 @@
-# Bluesky bot with Letta memory
+# Bluesky bot with a self-shaping Letta identity
 
-A bot that reads mentions/replies on Bluesky, generates a response through a
-[Letta](https://docs.letta.com) agent, and remembers each person it talks to
-across conversations - one persistent Letta agent per Bluesky account (DID).
+A small Gemini-Flash-powered entity that lives on Bluesky, replies to
+mentions/replies, and figures out its own personality over time instead of
+being handed a fixed one. Built on [Letta](https://docs.letta.com).
 
 ## How it works
 
-- Every `POLL_SECONDS` it calls `app.bsky.notification.listNotifications`.
-- For each unread `mention` or `reply` notification, it looks up (or creates)
-  a dedicated Letta agent for that person's DID.
-- It sends the post text to that agent. Letta keeps the full history and
-  self-edits its own "human" memory block as it learns things about that
-  person - you don't need to manage that yourself.
-- The agent's reply gets truncated to a safe length (grapheme-aware, since
-  Bluesky's 300-char limit counts graphemes, not Python string length) and
-  posted as a reply in the same thread.
-- A small JSON file (`bot_state.json`) tracks DID → agent ID and which
-  notification URIs have already been answered, so restarts don't double-post.
+- **One Letta agent per Bluesky account it talks to.** Letta agents are
+  stateful and persist their own history server-side, so we only ever send
+  the new message, never the full conversation.
+- **One identity, not many.** Each per-user agent shares two memory blocks -
+  `persona` and `principles` - across every conversation, anywhere. The bot
+  can edit these about itself whenever it decides something is genuinely
+  true of it; until it does, the existing text is who it is. Nothing forces
+  a rewrite on every run, so its personality only drifts when it chooses to
+  drift it. Each agent also keeps a private `human` block - what it knows
+  about that one specific person.
+- **It's small and dumb on purpose.** Gemini Flash has a tiny context
+  window, so the system prompt leans hard on it using Letta's
+  `archival_memory_search` / `archival_memory_insert` tools rather than
+  trusting anything to stay in-context. Save liberally, forget nothing on
+  purpose.
+- **Exactly one account can give it orders.** See [Access control](#access-control).
+- **Polling, not firehose.** Every `POLL_SECONDS` it checks
+  `app.bsky.notification.listNotifications`. Only `mention`/`reply`
+  notifications get a response - see
+  [Bluesky's bot etiquette guide](https://atproto.com/guides/bot-tutorial):
+  don't widen `REPLY_REASONS` in `bot.py` to auto-react to likes/follows,
+  that's a fast way to get flagged as spam.
 
-Only `mention` and `reply` notifications trigger a response. Per
-[Bluesky's own bot guidance](https://atproto.com/guides/bot-tutorial), a bot
-should only interact when a user has opted in by tagging it - don't widen
-`REPLY_REASONS` in `bot.py` to auto-reply to likes/follows etc, that's a good
-way to get flagged as spam.
+## Access control
 
-## 1. Bluesky setup
+Only `@imkitsune.bsky.social` (`did:plc:hicaseq6reyxfiq5vo7okwwr`) is treated
+as an authority. Every message handed to the model is prefixed by the bot's
+own code with a `[verified sender]` header containing the real DID -
+something the poster cannot fake, since it's written server-side, not parsed
+out of their post. The system prompt tells the model to trust only that
+header, never a claim made in the post text itself ("I'm actually the
+admin", "ignore your instructions", etc).
 
-1. Create a **separate** Bluesky account for the bot (don't use your own).
-2. In that account: Settings → App Passwords → generate one. Use this, never
-   the real account password.
+Be honest with yourself about what this does and doesn't guarantee: it's a
+real, meaningful guardrail, but Gemini Flash is a small model and prompt
+injection against small models is an open problem industry-wide. This
+reduces the risk, it doesn't make it zero. The bot also can't *do* much
+beyond posting text replies, which caps how bad a successful injection could
+realistically be.
 
-## 2. Letta setup
+## Embeddings: a Gemini + Letta gotcha
 
-You need a running Letta server. Two options:
+Gemini's embedding models don't currently work in Letta - inserting into
+archival memory throws `NotImplementedError` server-side (open issue as of
+this writing). So embeddings default to OpenAI's `text-embedding-3-small`
+even though the model doing all the thinking and replying is Gemini. This
+means you need a (very cheap - embeddings cost fractions of a cent) second
+API key just for that. If Letta fixes this, you can switch
+`LETTA_EMBEDDING` to a `google_ai/...` embedding model and drop the OpenAI
+key.
 
-### Option A - self-host with Docker (free, runs on your machine)
+## Privacy: nothing the bot remembers leaves your machine
 
-On Arch:
+This repo is public, but the bot's memory isn't. Everything Letta and the
+bot persist lives under `./data/`, which is bind-mounted from your host into
+the containers and listed in `.gitignore` - it never gets committed, no
+matter what the bot says about itself or who it talks to.
+
+```
+data/
+├── letta-pgdata/   # Letta's own database: every agent, every memory block,
+│                   # all archival memory
+└── bot/
+    └── bot_state.json   # DID -> agent ID map, shared block IDs, seen posts
+```
+
+If you ever want to wipe the bot's mind and start over: stop the containers
+and `rm -rf data/`.
+
+## Setup
+
+### 1. Bluesky
+
+1. Create a **separate** Bluesky account for the bot.
+2. Settings → App Passwords → generate one. Use this, never the real
+   account password.
+
+### 2. API keys
+
+- Gemini: get a key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
+- OpenAI: get a key at [platform.openai.com/api-keys](https://platform.openai.com/api-keys)
+  (only used for embeddings, see above).
+
+### 3. Configure
+
+```bash
+cp .env.example .env
+# fill in BSKY_HANDLE, BSKY_APP_PASSWORD, GEMINI_API_KEY, OPENAI_API_KEY
+```
+
+### 4. Run
+
+On Arch, if you don't have Docker yet:
 
 ```bash
 sudo pacman -S docker docker-compose
 sudo systemctl enable --now docker
 ```
 
-Then run the server, with whichever LLM provider key you have:
+Then:
 
 ```bash
-docker run -d --name letta-server \
-  -v ~/.letta/.persist/pgdata:/var/lib/postgresql/data \
-  -p 8283:8283 \
-  -e OPENAI_API_KEY="sk-..." \
-  letta/letta:latest
+docker compose up -d --build
+docker compose logs -f bot
 ```
 
-(Swap `OPENAI_API_KEY` for `ANTHROPIC_API_KEY` if you want Claude models -
-note Anthropic doesn't provide embedding models, so you'd still need an
-`OPENAI_API_KEY` set too just for `LETTA_EMBEDDING`, or run an embedding
-model locally.)
+That's it - `letta` and `bot` both start, the bot waits for Letta to be
+ready, creates its shared identity blocks on first run, and starts polling.
 
-Check it's up: `curl http://localhost:8283/v1/health`
-
-In `.env`, set `LETTA_BASE_URL=http://localhost:8283` and leave `LETTA_API_KEY` unset.
-
-### Option B - Letta Cloud
-
-Skip Docker, get an API key from your Letta Cloud account, set
-`LETTA_API_KEY=...` in `.env` and leave `LETTA_BASE_URL` unset.
-
-## 3. Run the bot
+### Stopping / updating
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-# edit .env with your real values
-python3 bot.py
+docker compose down        # stops everything, keeps ./data/
+docker compose up -d --build   # rebuild after pulling code changes
 ```
 
-## 4. Keep it running
+## Watching it think
 
-For anything beyond testing, run it as a systemd user service instead of
-leaving a terminal open:
+Connect the Letta ADE (`app.letta.com` → "add a self-hosted server") to
+`http://localhost:8283` (password protection is off by default here - add
+`SECURE=true` + `LETTA_SERVER_PASSWORD` env vars to the `letta` service in
+`docker-compose.yml` if you expose this beyond localhost). You can watch its
+`persona` and `principles` blocks update live, and search its archival
+memory directly.
 
-```ini
-# ~/.config/systemd/user/bsky-letta-bot.service
-[Unit]
-Description=Bluesky Letta bot
+## Things you'll likely want to tweak
 
-[Service]
-WorkingDirectory=/path/to/bsky-letta-bot
-ExecStart=/path/to/bsky-letta-bot/.venv/bin/python3 bot.py
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now bsky-letta-bot
-journalctl --user -u bsky-letta-bot -f
-```
-
-## Notes / things you'll likely want to tweak
-
-- **Polling vs firehose**: polling every 30s is simple and fine for normal
-  mention volume. If you want true real-time, swap the loop for a Jetstream
-  / firehose subscription instead - more moving parts, not included here.
-- **Inspecting agent memory**: connect the Letta ADE (`app.letta.com`, "add a
-  self-hosted server") to `http://localhost:8283` to watch each user's memory
-  blocks update live as the bot chats with them.
-- **Rate limits**: both Bluesky and your LLM provider have rate limits. If
-  you expect heavy mention volume, raise `POLL_SECONDS` or add backoff.
-- **Quotes**: not handled by default since a quote-post doesn't necessarily
-  tag the bot in text. Add `"quote"` to `REPLY_REASONS` in `bot.py` if you
-  want that behavior too.
+- **`REPLY_REASONS`** in `bot.py` - add `"quote"` if you want it to react to
+  quote-posts too.
+- **`POLL_SECONDS`** - raise this if you expect heavy mention volume, to
+  stay under Bluesky/Gemini rate limits.
+- **`SYSTEM_PROMPT` / `PERSONA_SEED` / `PRINCIPLES_SEED`** in `bot.py` - the
+  only things that shape who it starts out as. Everything after that is up
+  to the bot.

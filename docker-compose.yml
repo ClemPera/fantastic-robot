@@ -1,0 +1,28 @@
+services:
+  letta:
+    image: letta/letta:latest
+    restart: unless-stopped
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      # The bot's entire mind lives here, on your disk, outside the container.
+      # Never committed (see .gitignore) since this repo is public.
+      - ./data/letta-pgdata:/var/lib/postgresql/data
+    ports:
+      # Local-only, for the Letta ADE / debugging. Drop this entirely if you
+      # don't need it.
+      - "127.0.0.1:8283:8283"
+
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - letta
+    env_file:
+      - .env
+    environment:
+      - LETTA_BASE_URL=http://letta:8283
+      - STATE_FILE=/app/data/bot_state.json
+    volumes:
+      - ./data/bot:/app/data
