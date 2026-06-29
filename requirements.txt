@@ -1,0 +1,4 @@
+atproto>=0.0.55
+letta-client
+python-dotenv
+grapheme

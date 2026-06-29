@@ -1,0 +1,52 @@
+services:
+  # Local embedding model so archival memory works without paying for or
+  # depending on a third-party API. all-minilm is ~46MB - light enough for a
+  # Raspberry Pi. See .env.example if you want to size up to nomic-embed-text.
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ./data/ollama:/root/.ollama
+
+  # One-shot job: pulls the embedding model into the ollama service above,
+  # then exits. Retries until ollama is actually ready to accept requests.
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    entrypoint: ["sh", "-c", "until ollama pull all-minilm; do echo 'waiting for ollama...'; sleep 3; done"]
+
+  letta:
+    image: letta/letta:latest
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OLLAMA_BASE_URL=http://ollama:11434/v1
+    volumes:
+      # The bot's entire mind lives here, on your disk, outside the container.
+      # Never committed (see .gitignore) since this repo is public.
+      - ./data/letta-pgdata:/var/lib/postgresql/data
+    ports:
+      # Local-only, for the Letta ADE / debugging. Drop this entirely if you
+      # don't need it.
+      - "127.0.0.1:8283:8283"
+
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      letta:
+        condition: service_started
+      ollama-pull:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      - LETTA_BASE_URL=http://letta:8283
+      - STATE_FILE=/app/data/bot_state.json
+    volumes:
+      - ./data/bot:/app/data
